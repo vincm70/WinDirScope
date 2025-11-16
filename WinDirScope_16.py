@@ -5,13 +5,14 @@ import threading
 import csv
 import datetime
 import json
+import shutil
 from pathlib import Path
 from dataclasses import dataclass, field
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
-APP_VERSION = "1.1.0"  # version avec Top 100 + correctifs nom de fichier
+APP_VERSION = "1.2.0"  # version avec menu clic droit + progression corrigée
 
 
 @dataclass
@@ -65,6 +66,10 @@ def scan_directory(root_path: Path, progress_callback=None):
             try:
                 with os.scandir(path) as it:
                     for entry in it:
+                        # Une entrée = 1 "élément" pour la progression
+                        if progress_callback:
+                            progress_callback()
+
                         child_path = Path(entry.path)
                         try:
                             child_node = _scan(child_path, level + 1)
@@ -73,14 +78,12 @@ def scan_directory(root_path: Path, progress_callback=None):
                         except (PermissionError, FileNotFoundError, OSError):
                             # On ignore ce qu'on ne peut pas lire
                             continue
-                        finally:
-                            if progress_callback:
-                                progress_callback()
             except (PermissionError, FileNotFoundError, OSError):
                 # Accès totalement refusé à ce dossier
                 node.access_denied = True
             return node
         else:
+            # Pour les fichiers, on ne touche plus à la progression : déjà comptés comme entrée du dossier parent
             try:
                 size = path.stat().st_size
             except (PermissionError, FileNotFoundError, OSError):
@@ -92,9 +95,6 @@ def scan_directory(root_path: Path, progress_callback=None):
                 ext = "<sans extension>"
             ext_stats[ext] = ext_stats.get(ext, 0) + size
 
-            if progress_callback:
-                progress_callback()
-
             return node
 
     root_node = _scan(root_path, 0)
@@ -102,7 +102,7 @@ def scan_directory(root_path: Path, progress_callback=None):
 
 
 def open_file_in_default_app(path: Path):
-    """Ouvre le fichier donné avec l'application par défaut du système."""
+    """Ouvre le fichier ou le dossier donné avec l'application par défaut du système."""
     try:
         if os.name == "nt":  # Windows
             os.startfile(str(path))
@@ -138,6 +138,10 @@ class WinDirScopeApp:
 
         # Profondeur max d'affichage / analyse visible
         self.max_level_var = tk.IntVar(value=5)
+
+        # Pour le menu contextuel
+        self._context_item_id = None
+        self._context_node = None
 
         self._build_ui()
 
@@ -224,6 +228,18 @@ class WinDirScopeApp:
         # Style pour les dossiers en accès refusé
         self.tree.tag_configure("denied", foreground="red")
 
+        # Menu contextuel sur l’arborescence
+        self.tree_menu = tk.Menu(self.master, tearoff=False)
+        self.tree_menu.add_command(label="Ouvrir la cible", command=self.cmd_open_target)
+        self.tree_menu.add_command(label="Ouvrir le dossier contenant", command=self.cmd_open_containing)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Renommer…", command=self.cmd_rename_node)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Supprimer définitivement…", command=self.cmd_delete_node)
+
+        # Clic droit
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+
         # --- Tableau des extensions ---
         ext_frame = ttk.LabelFrame(paned, text="Répartition par extension")
         paned.add(ext_frame, weight=2)
@@ -306,6 +322,7 @@ class WinDirScopeApp:
                 "- Affichage arborescent avec tailles et pourcentages\n"
                 "- Répartition par extension\n"
                 "- Top 100 fichiers les plus volumineux\n"
+                "- Menu clic droit (ouvrir, renommer, supprimer)\n"
                 "- Export CSV / JSON / TXT / HTML (rapport HTML interactif)\n"
                 "- Indication visuelle des dossiers en accès refusé.\n"
             )
@@ -386,6 +403,7 @@ class WinDirScopeApp:
         if self.progress_total <= 0:
             self.progress_var.set(0.0)
             return
+        # On borne à 100 % au cas où, mais la logique de comptage est maintenant alignée
         percent = min(100.0, (self.progress_current / self.progress_total) * 100.0)
         self.progress_var.set(percent)
         if self.current_scan_path:
@@ -522,6 +540,165 @@ class WinDirScopeApp:
         visit(self.root_node)
         files.sort(key=lambda r: r["size_bytes"], reverse=True)
         self.top_files = files[:100]
+
+    # ---------- Menu contextuel arbre ----------
+
+    def on_tree_right_click(self, event):
+        """Affiche le menu contextuel sur l’élément sous le clic droit."""
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        self.tree.selection_set(item_id)
+        node = self.id_to_node.get(item_id)
+        if not node:
+            return
+        self._context_item_id = item_id
+        self._context_node = node
+        try:
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+    def _get_context_node(self):
+        if not self._context_item_id:
+            return None, None
+        return self._context_item_id, self._context_node
+
+    def cmd_open_target(self):
+        """Ouvre la cible (fichier ou dossier) avec l’appli par défaut."""
+        item_id, node = self._get_context_node()
+        if not node:
+            return
+        path = node.path
+        if not path.exists():
+            messagebox.showerror("Chemin introuvable", f"Le chemin n'existe plus :\n{path}")
+            return
+        open_file_in_default_app(path)
+
+    def cmd_open_containing(self):
+        """Ouvre le dossier contenant l’élément."""
+        item_id, node = self._get_context_node()
+        if not node:
+            return
+        path = node.path
+        if node.is_dir:
+            folder = path
+        else:
+            folder = path.parent
+        if not folder.exists():
+            messagebox.showerror("Chemin introuvable", f"Le dossier n'existe plus :\n{folder}")
+            return
+        open_file_in_default_app(folder)
+
+    def cmd_rename_node(self):
+        """Renomme un fichier ou un dossier (et met à jour les chemins enfants)."""
+        item_id, node = self._get_context_node()
+        if not node:
+            return
+
+        old_name = node.name
+        new_name = simpledialog.askstring(
+            "Renommer",
+            f"Nouveau nom pour :\n{node.path}",
+            initialvalue=old_name,
+            parent=self.master
+        )
+        if not new_name or new_name == old_name:
+            return
+
+        old_path = node.path
+        new_path = old_path.with_name(new_name)
+
+        if new_path.exists():
+            messagebox.showerror("Existe déjà", f"Un élément portant ce nom existe déjà :\n{new_path}")
+            return
+
+        try:
+            os.rename(old_path, new_path)
+        except Exception as e:
+            messagebox.showerror("Erreur de renommage", f"Impossible de renommer :\n{e}")
+            return
+
+        # Mise à jour du node
+        node.path = new_path
+        node.name = new_name
+
+        # Si dossier, il faut mettre à jour les chemins de tous les enfants
+        if node.is_dir:
+            self._update_child_paths(node, old_path, new_path)
+
+        # Mise à jour de l'affichage
+        self.tree.item(item_id, text=new_name)
+
+        messagebox.showinfo(
+            "Renommage effectué",
+            "Le renommage a été effectué sur le système de fichiers.\n"
+            "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
+            "Relancez une analyse si nécessaire."
+        )
+
+    def _update_child_paths(self, parent_node: Node, old_root: Path, new_root: Path):
+        """Met à jour les paths des enfants après renommage d’un dossier."""
+        for child in parent_node.children:
+            try:
+                rel = child.path.relative_to(old_root)
+                child.path = new_root / rel
+            except ValueError:
+                # Si pour une raison quelconque le chemin n'est pas sous old_root
+                pass
+            if child.is_dir:
+                self._update_child_paths(child, old_root, new_root)
+
+    def cmd_delete_node(self):
+        """Supprime définitivement un fichier ou un dossier."""
+        item_id, node = self._get_context_node()
+        if not node:
+            return
+
+        path = node.path
+
+        if not path.exists():
+            messagebox.showerror("Chemin introuvable", f"Le chemin n'existe plus :\n{path}")
+            return
+
+        type_txt = "dossier" if node.is_dir else "fichier"
+        if not messagebox.askyesno(
+            "Suppression définitive",
+            f"ATTENTION : ceci va SUPPRIMER DÉFINITIVEMENT le {type_txt} :\n\n"
+            f"{path}\n\n"
+            "Cette action ne passe pas par la corbeille et est irréversible.\n\n"
+            "Confirmer la suppression ?",
+            icon=messagebox.WARNING
+        ):
+            return
+
+        try:
+            if node.is_dir:
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except Exception as e:
+            messagebox.showerror("Erreur de suppression", f"Impossible de supprimer :\n{e}")
+            return
+
+        # Retirer du modèle et de l'arbre
+        parent_item_id = self.tree.parent(item_id)
+        parent_node = self.id_to_node.get(parent_item_id)
+
+        if parent_node:
+            parent_node.children = [c for c in parent_node.children if c is not node]
+
+        if item_id in self.id_to_node:
+            del self.id_to_node[item_id]
+
+        self.tree.delete(item_id)
+
+        messagebox.showinfo(
+            "Suppression effectuée",
+            "Le fichier / dossier a été supprimé du système de fichiers.\n"
+            "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
+            "Relancez une analyse si nécessaire."
+        )
 
     # ---------- Flatten commun ----------
 
@@ -665,453 +842,4 @@ class WinDirScopeApp:
         with filepath.open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
             writer.writerow(["Extension", "Taille totale (octets)", "Taille lisible", "% du total"])
-            for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
-                percent = (size / total_ext_size) * 100
-                writer.writerow([
-                    ext,
-                    size,
-                    human_size(size),
-                    f"{percent:.4f}",
-                ])
-
-    def _export_top_csv(self, filepath: Path):
-        with filepath.open("w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f, delimiter=";")
-            writer.writerow([
-                "Chemin complet",
-                "Nom",
-                "Taille (octets)",
-                "Taille lisible",
-                "% du total",
-                "Niveau"
-            ])
-            for row in self.top_files:
-                writer.writerow([
-                    row["path"],
-                    row["name"],
-                    row["size_bytes"],
-                    row["size_human"],
-                    f"{row['percent_total']:.4f}",
-                    row["level"],
-                ])
-
-    # --- JSON ---
-
-    def _export_tree_json(self, filepath: Path):
-        rows = self._flatten_tree()
-        with filepath.open("w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
-
-    def _export_ext_json(self, filepath: Path):
-        total_ext_size = sum(self.ext_stats.values()) or 1
-        items = []
-        for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
-            percent = (size / total_ext_size) * 100
-            items.append({
-                "extension": ext,
-                "size_bytes": size,
-                "size_human": human_size(size),
-                "percent_total": percent,
-            })
-        with filepath.open("w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False, indent=2)
-
-    def _export_top_json(self, filepath: Path):
-        with filepath.open("w", encoding="utf-8") as f:
-            json.dump(self.top_files, f, ensure_ascii=False, indent=2)
-
-    # --- TXT ---
-
-    def _export_tree_txt(self, filepath: Path):
-        rows = self._flatten_tree()
-        with filepath.open("w", encoding="utf-8") as f:
-            for row in rows:
-                indent = "  " * int(row["level"])
-                line = (
-                    f"{indent}{row['name']} "
-                    f"({row['type']}, {row['size_human']}, "
-                    f"{row['percent_total']:.2f} %, "
-                    f"accès refusé: {'Oui' if row['access_denied'] else 'Non'}) "
-                    f"- {row['path']}"
-                )
-                f.write(line + "\n")
-
-    def _export_ext_txt(self, filepath: Path):
-        total_ext_size = sum(self.ext_stats.values()) or 1
-        with filepath.open("w", encoding="utf-8") as f:
-            for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
-                percent = (size / total_ext_size) * 100
-                line = f"{ext}: {human_size(size)} ({percent:.2f} %, {size} octets)"
-                f.write(line + "\n")
-
-    def _export_top_txt(self, filepath: Path):
-        with filepath.open("w", encoding="utf-8") as f:
-            for row in self.top_files:
-                line = (
-                    f"{row['name']} "
-                    f"({row['size_human']}, {row['percent_total']:.2f} %, niveau {row['level']}) "
-                    f"- {row['path']}"
-                )
-                f.write(line + "\n")
-
-    # --- HTML ---
-
-    def _export_html(self, filepath: Path):
-        """Export en page HTML avec dossiers repliables/dépliables, filtres et Top 100 fichiers."""
-        def esc(s: str) -> str:
-            return (
-                s.replace("&", "&amp;")
-                 .replace("<", "&lt;")
-                 .replace(">", "&gt;")
-                 .replace("\"", "&quot;")
-            )
-
-        total_size = self.root_node.size or 1
-        total_ext_size = sum(self.ext_stats.values()) or 1
-
-        def node_to_html(node: Node) -> str:
-            percent = (node.size / total_size) * 100
-            name_raw = node.name
-            name = esc(name_raw)
-            name_lc = esc(name_raw.lower())
-            path = esc(str(node.path))
-            size_h = esc(human_size(node.size))
-            type_txt = "dossier" if node.is_dir else "fichier"
-            lvl = node.level
-            denied = node.access_denied
-
-            info = (
-                f"{type_txt}, niveau {lvl}, {size_h}, "
-                f"{percent:.2f} %, "
-                f"{'ACCÈS REFUSÉ' if denied else 'OK'}"
-            )
-
-            line = (
-                f'<span class="name">{name}</span> '
-                f'<span class="meta">({esc(info)})</span><br>'
-                f'<span class="path">{path}</span>'
-            )
-
-            if node.is_dir:
-                open_attr = " open" if node.level <= 1 else ""
-                classes = "dir node denied" if denied else "dir node"
-                html = [
-                    f'<details{open_attr}>'
-                    f'<summary class="{classes}" '
-                    f'data-name="{name_lc}" data-level="{lvl}" data-type="dir">'
-                    f'{line}</summary>'
-                ]
-                if node.children:
-                    html.append("<ul>")
-                    for child in sorted(node.children, key=lambda n: n.size, reverse=True):
-                        html.append("<li>")
-                        html.append(node_to_html(child))
-                        html.append("</li>")
-                    html.append("</ul>")
-                html.append("</details>")
-                return "".join(html)
-            else:
-                classes = "file node denied" if denied else "file node"
-                return (
-                    f'<div class="{classes}" '
-                    f'data-name="{name_lc}" data-level="{lvl}" data-type="file">'
-                    f'{line}</div>'
-                )
-
-        html_parts = []
-        html_parts.append("<!DOCTYPE html>")
-        html_parts.append("<html lang='fr'>")
-        html_parts.append("<head>")
-        html_parts.append("<meta charset='utf-8'>")
-        html_parts.append(f"<title>WinDirScope - Rapport {esc(self.root_node.name)}</title>")
-        html_parts.append("<style>")
-        html_parts.append("""
-            body {
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                font-size: 14px;
-                background: #f5f5f5;
-                color: #222;
-                margin: 0;
-                padding: 0;
-            }
-            header {
-                background: #2c3e50;
-                color: #ecf0f1;
-                padding: 10px 16px;
-            }
-            header h1 {
-                margin: 0;
-                font-size: 18px;
-            }
-            header .subtitle {
-                font-size: 12px;
-                opacity: 0.9;
-            }
-            main {
-                display: grid;
-                grid-template-columns: 2fr 1fr 2fr;
-                gap: 16px;
-                padding: 16px;
-            }
-            section {
-                background: #ffffff;
-                border-radius: 6px;
-                box-shadow: 0 2px 4px rgba(0,0,0,0.08);
-                padding: 12px 16px;
-                box-sizing: border-box;
-                max-height: 80vh;
-                overflow: auto;
-            }
-            #filters {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-                align-items: center;
-                margin-bottom: 8px;
-                font-size: 12px;
-            }
-            #filters label {
-                display: flex;
-                flex-direction: column;
-                gap: 2px;
-            }
-            #filters input {
-                padding: 2px 4px;
-                font-size: 12px;
-            }
-            #filters button {
-                padding: 2px 8px;
-                font-size: 12px;
-                cursor: pointer;
-            }
-            details {
-                margin-left: 8px;
-                margin-top: 4px;
-            }
-            summary {
-                cursor: pointer;
-            }
-            .name {
-                font-weight: 600;
-            }
-            .meta {
-                font-size: 11px;
-                color: #555;
-            }
-            .path {
-                font-size: 11px;
-                color: #888;
-            }
-            .dir {
-                color: #2c3e50;
-            }
-            .file {
-                margin-left: 20px;
-            }
-            .denied {
-                color: #c0392b;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 12px;
-            }
-            th, td {
-                border-bottom: 1px solid #ddd;
-                padding: 4px 6px;
-                text-align: right;
-            }
-            th:first-child, td:first-child {
-                text-align: left;
-            }
-            th {
-                background: #f0f0f0;
-                position: sticky;
-                top: 0;
-                z-index: 1;
-            }
-            footer {
-                font-size: 11px;
-                color: #666;
-                padding: 8px 16px 12px 16px;
-            }
-        """)
-        html_parts.append("</style>")
-        html_parts.append("</head>")
-        html_parts.append("<body>")
-
-        html_parts.append("<header>")
-        html_parts.append("<h1>WinDirScope - Rapport d'analyse</h1>")
-        html_parts.append("<div class='subtitle'>")
-        html_parts.append(f"Dossier racine : {esc(str(self.root_node.path))}<br>")
-        html_parts.append(f"Taille totale : {esc(human_size(self.root_node.size))}")
-        html_parts.append("</div>")
-        html_parts.append("</header>")
-
-        html_parts.append("<main>")
-        # Arborescence
-        html_parts.append("<section class='tree'>")
-        html_parts.append("<h2>Arborescence</h2>")
-        html_parts.append("""
-        <div id="filters">
-          <label>
-            Nom contient :
-            <input type="text" id="filter-name" placeholder="texte à rechercher">
-          </label>
-          <label>
-            Niveau max :
-            <input type="number" id="filter-level" min="0" placeholder="ex : 3">
-          </label>
-          <button type="button" id="filter-apply">Appliquer</button>
-          <button type="button" id="filter-reset">Réinitialiser</button>
-        </div>
-        """)
-        html_parts.append(node_to_html(self.root_node))
-        html_parts.append("</section>")
-
-        # Extensions
-        html_parts.append("<section class='ext'>")
-        html_parts.append("<h2>Répartition par extension</h2>")
-        html_parts.append("<table>")
-        html_parts.append("<thead><tr><th>Extension</th><th>Taille lisible</th><th>Taille (octets)</th><th>% du total</th></tr></thead>")
-        html_parts.append("<tbody>")
-        for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
-            percent = (size / total_ext_size) * 100 if total_ext_size > 0 else 0.0
-            html_parts.append(
-                "<tr>"
-                f"<td>{esc(ext)}</td>"
-                f"<td>{esc(human_size(size))}</td>"
-                f"<td>{size}</td>"
-                f"<td>{percent:.2f}</td>"
-                "</tr>"
-            )
-        html_parts.append("</tbody></table>")
-        html_parts.append("</section>")
-
-        # Top 100 fichiers
-        html_parts.append("<section class='top'>")
-        html_parts.append("<h2>Top 100 fichiers les plus volumineux</h2>")
-        html_parts.append("<table>")
-        html_parts.append("<thead><tr><th>Nom</th><th>Taille lisible</th><th>Taille (octets)</th><th>% du total</th><th>Chemin complet</th></tr></thead>")
-        html_parts.append("<tbody>")
-        for row in self.top_files:
-            html_parts.append(
-                "<tr>"
-                f"<td>{esc(row['name'])}</td>"
-                f"<td>{esc(row['size_human'])}</td>"
-                f"<td>{row['size_bytes']}</td>"
-                f"<td>{row['percent_total']:.2f}</td>"
-                f"<td>{esc(row['path'])}</td>"
-                "</tr>"
-            )
-        html_parts.append("</tbody></table>")
-        html_parts.append("</section>")
-
-        html_parts.append("</main>")
-
-        html_parts.append("<footer>")
-        html_parts.append(
-            f"Rapport généré par WinDirScope v{APP_VERSION} le "
-            f"{datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}."
-        )
-        html_parts.append("</footer>")
-
-        # Script JS pour filtres nom + niveau (corrigé avec masquage des <li>)
-        html_parts.append("""
-<script>
-(function() {
-  const nameInput = document.getElementById('filter-name');
-  const levelInput = document.getElementById('filter-level');
-  const applyBtn = document.getElementById('filter-apply');
-  const resetBtn = document.getElementById('filter-reset');
-
-  function applyFilters() {
-    const nameFilter = (nameInput && nameInput.value || '').toLowerCase().trim();
-    const levelValue = levelInput && levelInput.value;
-    const levelFilter = parseInt(levelValue, 10);
-    const hasLevelFilter = !isNaN(levelFilter);
-
-    const nodes = document.querySelectorAll('.node');
-
-    // 1) Marquer chaque noeud comme match / non-match
-    nodes.forEach(function(el) {
-      const name = (el.dataset.name || '').toLowerCase();
-      const level = parseInt(el.dataset.level || '0', 10);
-
-      let match = true;
-      if (nameFilter && name.indexOf(nameFilter) === -1) {
-        match = false;
-      }
-      if (hasLevelFilter && level > levelFilter) {
-        match = false;
-      }
-
-      el.dataset.match = match ? '1' : '0';
-    });
-
-    // 2) Un dossier est visible s'il matche lui-même
-    //    OU s'il contient au moins un descendant qui matche
-    nodes.forEach(function(el) {
-      const type = el.dataset.type || 'file';
-      let visible = (el.dataset.match === '1');
-
-      if (type === 'dir' && !visible) {
-        const details = el.closest('details');
-        if (details) {
-          const childMatch = details.querySelector('.node[data-match="1"]');
-          if (childMatch) {
-            visible = true;
-          }
-        }
-      }
-
-      // On masque de préférence le <li> qui entoure la node (pour éviter les puces vides)
-      let container = el.closest('li');
-      if (!container) {
-        if (type === 'dir') {
-          container = el.closest('details') || el;
-        } else {
-          container = el;
-        }
-      }
-
-      container.style.display = visible ? '' : 'none';
-    });
-  }
-
-  function resetFilters() {
-    if (nameInput) nameInput.value = '';
-    if (levelInput) levelInput.value = '';
-
-    const details = document.querySelectorAll('details');
-    details.forEach(function(d) {
-      d.style.display = '';
-    });
-    const nodes = document.querySelectorAll('.node');
-    nodes.forEach(function(el) {
-      el.style.display = '';
-      el.dataset.match = '1';
-    });
-  }
-
-  if (applyBtn) applyBtn.addEventListener('click', applyFilters);
-  if (resetBtn) resetBtn.addEventListener('click', resetFilters);
-  if (nameInput) nameInput.addEventListener('input', applyFilters);
-})();
-</script>
-""")
-
-        html_parts.append("</body></html>")
-
-        with filepath.open("w", encoding="utf-8") as f:
-            f.write("".join(html_parts))
-
-
-def main():
-    root = tk.Tk()
-    app = WinDirScopeApp(root)
-    root.mainloop()
-
-
-if __name__ == "__main__":
-    main()
+        ...
