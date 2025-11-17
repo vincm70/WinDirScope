@@ -6,13 +6,15 @@ import csv
 import datetime
 import json
 import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 from dataclasses import dataclass, field
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
-APP_VERSION = "1.3.0"  # version avec menus contextuels arbre + Top100 + suppression améliorée
+APP_VERSION = "1.4.0"  # ajout : envoi par mail + menus contextuels + suppression améliorée
 
 
 @dataclass
@@ -83,7 +85,7 @@ def scan_directory(root_path: Path, progress_callback=None):
                 node.access_denied = True
             return node
         else:
-            # Pour les fichiers, on ne touche plus à la progression :
+            # Pour les fichiers, on ne touche plus à la progression,
             # ils sont déjà comptés comme entrées du dossier parent.
             try:
                 size = path.stat().st_size
@@ -137,14 +139,14 @@ class WinDirScopeApp:
         self.progress_current = 0
         self.progress_var = tk.DoubleVar(value=0.0)
 
-        # Profondeur max d'affichage / analyse visible
+        # Profondeur max d'affichage
         self.max_level_var = tk.IntVar(value=5)
 
-        # Pour le menu contextuel de l’arborescence
+        # Contexte menu arbre
         self._context_item_id = None
         self._context_node = None
 
-        # Pour le menu contextuel du Top 100
+        # Contexte menu Top 100
         self._top_context_id = None
         self.top_id_to_path = {}
 
@@ -155,29 +157,23 @@ class WinDirScopeApp:
     def _build_ui(self):
         self._build_menu()
 
-        # Barre supérieure : boutons + label + profondeur + barre de progression
+        # Barre supérieure
         top_frame = ttk.Frame(self.master)
         top_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
 
         self.btn_select = ttk.Button(
-            top_frame,
-            text="Analyser un dossier…",
-            command=self.on_select_folder
+            top_frame, text="Analyser un dossier…", command=self.on_select_folder
         )
         self.btn_select.pack(side=tk.LEFT)
 
         self.btn_export = ttk.Button(
-            top_frame,
-            text="Exporter…",
-            command=self.on_export_results,
-            state="disabled"  # activé après une analyse réussie
+            top_frame, text="Exporter…", command=self.on_export_results, state="disabled"
         )
         self.btn_export.pack(side=tk.LEFT, padx=(5, 0))
 
         self.lbl_status = ttk.Label(top_frame, text="Aucun dossier analysé.")
         self.lbl_status.pack(side=tk.LEFT, padx=10)
 
-        # Choix profondeur max
         self.lbl_level = ttk.Label(top_frame, text="Profondeur analysée (niveaux) :")
         self.lbl_level.pack(side=tk.LEFT, padx=(10, 2))
 
@@ -187,7 +183,7 @@ class WinDirScopeApp:
             to=20,
             textvariable=self.max_level_var,
             width=3,
-            command=self.on_change_max_level
+            command=self.on_change_max_level,
         )
         self.spin_level.pack(side=tk.LEFT)
 
@@ -196,24 +192,20 @@ class WinDirScopeApp:
             orient="horizontal",
             mode="determinate",
             variable=self.progress_var,
-            maximum=100
+            maximum=100,
         )
         self.progress.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=5)
 
-        # Split vertical : 3 zones (arbre, extensions, top 100)
+        # Split vertical : 3 zones
         paned = ttk.PanedWindow(self.master, orient=tk.VERTICAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # --- Arbre principal ---
+        # --- Arborescence ---
         tree_frame = ttk.Frame(paned)
         paned.add(tree_frame, weight=3)
 
         columns = ("level", "size", "percent")
-        self.tree = ttk.Treeview(
-            tree_frame,
-            columns=columns,
-            show="tree headings"
-        )
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings")
         self.tree.heading("#0", text="Dossier / Fichier")
         self.tree.heading("level", text="Niveau")
         self.tree.heading("size", text="Taille")
@@ -230,31 +222,30 @@ class WinDirScopeApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Style pour les dossiers en accès refusé
         self.tree.tag_configure("denied", foreground="red")
 
-        # Menu contextuel sur l’arborescence
+        # Menu contextuel arbre
         self.tree_menu = tk.Menu(self.master, tearoff=False)
         self.tree_menu.add_command(label="Ouvrir la cible", command=self.cmd_open_target)
-        self.tree_menu.add_command(label="Ouvrir le dossier contenant", command=self.cmd_open_containing)
+        self.tree_menu.add_command(
+            label="Ouvrir le dossier contenant", command=self.cmd_open_containing
+        )
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Renommer…", command=self.cmd_rename_node)
         self.tree_menu.add_separator()
-        self.tree_menu.add_command(label="Supprimer définitivement…", command=self.cmd_delete_node)
+        self.tree_menu.add_command(
+            label="Supprimer définitivement…", command=self.cmd_delete_node
+        )
 
-        # Clic droit sur l'arbre
         self.tree.bind("<Button-3>", self.on_tree_right_click)
 
-        # --- Tableau des extensions ---
+        # --- Répartition par extension ---
         ext_frame = ttk.LabelFrame(paned, text="Répartition par extension")
         paned.add(ext_frame, weight=2)
 
         ext_columns = ("ext", "size", "percent")
         self.ext_tree = ttk.Treeview(
-            ext_frame,
-            columns=ext_columns,
-            show="headings",
-            height=4
+            ext_frame, columns=ext_columns, show="headings", height=4
         )
         self.ext_tree.heading("ext", text="Extension")
         self.ext_tree.heading("size", text="Taille totale")
@@ -276,10 +267,7 @@ class WinDirScopeApp:
 
         top_columns = ("size", "percent", "path")
         self.top_tree = ttk.Treeview(
-            top_frame,
-            columns=top_columns,
-            show="headings",
-            height=6
+            top_frame, columns=top_columns, show="headings", height=6
         )
         self.top_tree.heading("size", text="Taille")
         self.top_tree.heading("percent", text="% du total")
@@ -297,12 +285,18 @@ class WinDirScopeApp:
 
         # Menu contextuel Top 100
         self.top_tree_menu = tk.Menu(self.master, tearoff=False)
-        self.top_tree_menu.add_command(label="Ouvrir la cible", command=self.cmd_top_open_target)
-        self.top_tree_menu.add_command(label="Ouvrir le dossier contenant", command=self.cmd_top_open_containing)
+        self.top_tree_menu.add_command(
+            label="Ouvrir la cible", command=self.cmd_top_open_target
+        )
+        self.top_tree_menu.add_command(
+            label="Ouvrir le dossier contenant", command=self.cmd_top_open_containing
+        )
         self.top_tree_menu.add_separator()
         self.top_tree_menu.add_command(label="Renommer…", command=self.cmd_top_rename)
         self.top_tree_menu.add_separator()
-        self.top_tree_menu.add_command(label="Supprimer définitivement…", command=self.cmd_top_delete)
+        self.top_tree_menu.add_command(
+            label="Supprimer définitivement…", command=self.cmd_top_delete
+        )
 
         self.top_tree.bind("<Button-3>", self.on_top_right_click)
 
@@ -312,7 +306,18 @@ class WinDirScopeApp:
 
         file_menu = tk.Menu(menubar, tearoff=False)
         file_menu.add_command(label="Analyser un dossier…", command=self.on_select_folder)
-        file_menu.add_command(label="Exporter les résultats…", command=self.on_export_results)
+        file_menu.add_command(
+            label="Exporter les résultats…", command=self.on_export_results
+        )
+
+        # Sous-menu "Envoyer le rapport par mail"
+        send_menu = tk.Menu(file_menu, tearoff=False)
+        send_menu.add_command(label="HTML", command=lambda: self.on_send_report("html"))
+        send_menu.add_command(label="CSV", command=lambda: self.on_send_report("csv"))
+        send_menu.add_command(label="JSON", command=lambda: self.on_send_report("json"))
+        send_menu.add_command(label="TXT", command=lambda: self.on_send_report("txt"))
+        file_menu.add_cascade(label="Envoyer le rapport par mail", menu=send_menu)
+
         file_menu.add_separator()
         file_menu.add_command(label="Quitter", command=self.master.quit)
         menubar.add_cascade(label="Fichier", menu=file_menu)
@@ -340,8 +345,9 @@ class WinDirScopeApp:
                 "- Top 100 fichiers les plus volumineux\n"
                 "- Menus clic droit (ouvrir, renommer, supprimer)\n"
                 "- Export CSV / JSON / TXT / HTML (rapport HTML interactif)\n"
+                "- Envoi du rapport par mail (Outlook si disponible)\n"
                 "- Indication visuelle des dossiers en accès refusé.\n"
-            )
+            ),
         )
 
     def on_select_folder(self):
@@ -355,31 +361,28 @@ class WinDirScopeApp:
 
         path = Path(folder)
         if not path.exists():
-            messagebox.showerror("Erreur", "Ce dossier n'existe pas ou n'est pas accessible.")
+            messagebox.showerror(
+                "Erreur", "Ce dossier n'existe pas ou n'est pas accessible."
+            )
             return
 
-        # Pré-comptage des entrées pour la progression
         self.current_scan_path = path
         self.progress_total = count_entries(path)
         self.progress_current = 0
         self.progress_var.set(0.0)
 
-        # Lancer le scan dans un thread
         self.scan_running = True
         self.btn_export.config(state="disabled")
         self.lbl_status.config(text=f"Analyse en cours : {folder}")
         self._clear_views()
 
         self.scan_thread = threading.Thread(
-            target=self._scan_worker,
-            args=(path,),
-            daemon=True
+            target=self._scan_worker, args=(path,), daemon=True
         )
         self.scan_thread.start()
         self.master.after(200, self._poll_scan_thread)
 
     def _scan_worker(self, path: Path):
-        """Fonction exécutée dans un thread séparé."""
         try:
             root_node, ext_stats = scan_directory(path, progress_callback=self._progress_tick)
             self.root_node = root_node
@@ -391,14 +394,12 @@ class WinDirScopeApp:
             self._scan_error = e
 
     def _progress_tick(self):
-        """Appelée dans le thread de scan pour incrémenter le compteur."""
         self.progress_current += 1
 
     def _poll_scan_thread(self):
         if self.scan_thread is None:
             return
 
-        # Met à jour la barre de progression
         self._update_progress_ui()
 
         if self.scan_thread.is_alive():
@@ -410,7 +411,6 @@ class WinDirScopeApp:
                 self.lbl_status.config(text="Erreur lors de l'analyse.")
             else:
                 self.lbl_status.config(text=f"Analyse terminée : {self.root_node.path}")
-                # Calcul du Top 100 fichiers
                 self._compute_top_files()
                 self._populate_views()
                 self.btn_export.config(state="normal")
@@ -423,18 +423,19 @@ class WinDirScopeApp:
         self.progress_var.set(percent)
         if self.current_scan_path:
             self.lbl_status.config(
-                text=f"Analyse en cours : {self.current_scan_path} "
-                     f"({self.progress_current}/{self.progress_total} éléments, {percent:5.1f} %)"
+                text=(
+                    f"Analyse en cours : {self.current_scan_path} "
+                    f"({self.progress_current}/{self.progress_total} éléments, {percent:5.1f} %)"
+                )
             )
 
     def on_change_max_level(self):
-        """Re-génère la vue arbre selon la profondeur choisie."""
         if not self.root_node or self.scan_running:
             return
         self._clear_tree_view()
         self._populate_tree_view()
 
-    # ---------- Gestion de l'affichage ----------
+    # ---------- Affichage ----------
 
     def _clear_views(self):
         self._clear_tree_view()
@@ -465,14 +466,14 @@ class WinDirScopeApp:
         if not self.root_node:
             return
 
-        total_size = self.root_node.size or 1  # éviter division par zéro
+        total_size = self.root_node.size or 1
 
         try:
             max_level = int(self.max_level_var.get())
         except (TypeError, ValueError):
             max_level = 5
 
-        def add_node_to_tree(parent_id, node: Node):
+        def add_node(parent_id, node: Node):
             if node.level > max_level:
                 return
 
@@ -491,17 +492,16 @@ class WinDirScopeApp:
                 iid=tree_id,
                 text=text,
                 values=(node.level, human_size(node.size), f"{percent:5.2f} %"),
-                tags=tags
+                tags=tags,
             )
             if node.is_dir:
                 for child in sorted(node.children, key=lambda n: n.size, reverse=True):
-                    add_node_to_tree(tree_id, child)
+                    add_node(tree_id, child)
 
-        add_node_to_tree("", self.root_node)
-        # Ouvrir le premier niveau
-        first_child = self.tree.get_children()
-        if first_child:
-            self.tree.item(first_child[0], open=True)
+        add_node("", self.root_node)
+        first = self.tree.get_children()
+        if first:
+            self.tree.item(first[0], open=True)
 
     def _populate_ext_view(self):
         self.ext_tree.delete(*self.ext_tree.get_children())
@@ -511,7 +511,7 @@ class WinDirScopeApp:
             self.ext_tree.insert(
                 "",
                 "end",
-                values=(ext, human_size(size), f"{percent:5.2f} %")
+                values=(ext, human_size(size), f"{percent:5.2f} %"),
             )
 
     def _populate_top_files_view(self):
@@ -525,14 +525,13 @@ class WinDirScopeApp:
                     row["size_human"],
                     f"{row['percent_total']:.2f} %",
                     row["path"],
-                )
+                ),
             )
             self.top_id_to_path[item_id] = Path(row["path"])
 
-    # ---------- Calcul Top 100 fichiers ----------
+    # ---------- Top 100 ----------
 
     def _compute_top_files(self):
-        """Calcule la liste des 100 fichiers les plus volumineux."""
         self.top_files = []
         if not self.root_node:
             return
@@ -546,14 +545,16 @@ class WinDirScopeApp:
                     visit(c)
             else:
                 percent = (node.size / total_size) * 100
-                files.append({
-                    "path": str(node.path),
-                    "name": node.name,
-                    "size_bytes": node.size,
-                    "size_human": human_size(node.size),
-                    "percent_total": percent,
-                    "level": node.level,
-                })
+                files.append(
+                    {
+                        "path": str(node.path),
+                        "name": node.name,
+                        "size_bytes": node.size,
+                        "size_human": human_size(node.size),
+                        "percent_total": percent,
+                        "level": node.level,
+                    }
+                )
 
         visit(self.root_node)
         files.sort(key=lambda r: r["size_bytes"], reverse=True)
@@ -562,7 +563,6 @@ class WinDirScopeApp:
     # ---------- Menu contextuel arbre ----------
 
     def on_tree_right_click(self, event):
-        """Affiche le menu contextuel sur l’élément sous le clic droit."""
         item_id = self.tree.identify_row(event.y)
         if not item_id:
             return
@@ -583,7 +583,6 @@ class WinDirScopeApp:
         return self._context_item_id, self._context_node
 
     def cmd_open_target(self):
-        """Ouvre la cible (fichier ou dossier) avec l’appli par défaut."""
         item_id, node = self._get_context_node()
         if not node:
             return
@@ -594,28 +593,26 @@ class WinDirScopeApp:
         open_file_in_default_app(path)
 
     def cmd_open_containing(self):
-        """Ouvre le dossier contenant l’élément (pour l’arborescence)."""
         item_id, node = self._get_context_node()
         if not node:
             return
         path = node.path
-        if node.is_dir:
-            folder = path
-        else:
-            folder = path.parent
+        folder = path if node.is_dir else path.parent
         if not folder.exists():
             messagebox.showerror("Chemin introuvable", f"Le dossier n'existe plus :\n{folder}")
             return
         open_file_in_default_app(folder)
 
     def cmd_rename_node(self):
-        """Renomme un fichier ou un dossier de l'arbre (et met à jour les chemins enfants)."""
         item_id, node = self._get_context_node()
         if not node:
             return
 
         if node is self.root_node:
-            messagebox.showwarning("Renommage refusé", "Le dossier racine ne peut pas être renommé ici.")
+            messagebox.showwarning(
+                "Renommage refusé",
+                "Le dossier racine ne peut pas être renommé ici.",
+            )
             return
 
         old_name = node.name
@@ -623,7 +620,7 @@ class WinDirScopeApp:
             "Renommer",
             f"Nouveau nom pour :\n{node.path}",
             initialvalue=old_name,
-            parent=self.master
+            parent=self.master,
         )
         if not new_name or new_name == old_name:
             return
@@ -632,7 +629,10 @@ class WinDirScopeApp:
         new_path = old_path.with_name(new_name)
 
         if new_path.exists():
-            messagebox.showerror("Existe déjà", f"Un élément portant ce nom existe déjà :\n{new_path}")
+            messagebox.showerror(
+                "Existe déjà",
+                f"Un élément portant ce nom existe déjà :\n{new_path}",
+            )
             return
 
         try:
@@ -641,26 +641,22 @@ class WinDirScopeApp:
             messagebox.showerror("Erreur de renommage", f"Impossible de renommer :\n{e}")
             return
 
-        # Mise à jour du node
         node.path = new_path
         node.name = new_name
 
-        # Si dossier, il faut mettre à jour les chemins de tous les enfants
         if node.is_dir:
             self._update_child_paths(node, old_path, new_path)
 
-        # Mise à jour de l'affichage
         self.tree.item(item_id, text=new_name)
 
         messagebox.showinfo(
             "Renommage effectué",
             "Le renommage a été effectué sur le système de fichiers.\n"
             "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
-            "Relancez une analyse si nécessaire."
+            "Relancez une analyse si nécessaire.",
         )
 
     def _update_child_paths(self, parent_node: Node, old_root: Path, new_root: Path):
-        """Met à jour les paths des enfants après renommage d’un dossier."""
         for child in parent_node.children:
             try:
                 rel = child.path.relative_to(old_root)
@@ -671,7 +667,6 @@ class WinDirScopeApp:
                 self._update_child_paths(child, old_root, new_root)
 
     def cmd_delete_node(self):
-        """Supprime définitivement un fichier ou un dossier de l'arbre."""
         item_id, node = self._get_context_node()
         if not node:
             return
@@ -679,12 +674,11 @@ class WinDirScopeApp:
         if node is self.root_node:
             messagebox.showwarning(
                 "Suppression refusée",
-                "Le dossier racine ne peut pas être supprimé depuis cette interface."
+                "Le dossier racine ne peut pas être supprimé depuis cette interface.",
             )
             return
 
         path = node.path
-
         if not path.exists():
             messagebox.showerror("Chemin introuvable", f"Le chemin n'existe plus :\n{path}")
             return
@@ -696,12 +690,11 @@ class WinDirScopeApp:
             f"{path}\n\n"
             "Cette action ne passe pas par la corbeille et est irréversible.\n\n"
             "Confirmer la suppression ?",
-            icon=messagebox.WARNING
+            icon=messagebox.WARNING,
         ):
             return
 
         try:
-            # On revérifie directement sur le système de fichiers
             if path.is_dir():
                 shutil.rmtree(path)
             else:
@@ -714,14 +707,13 @@ class WinDirScopeApp:
                 "- fichier/dossier ouvert dans une autre application,\n"
                 "- antivirus ou logiciel de sauvegarde qui le verrouille,\n"
                 "- droits NTFS insuffisants.\n\n"
-                f"Détail :\n{e}"
+                f"Détail :\n{e}",
             )
             return
         except Exception as e:
             messagebox.showerror("Erreur de suppression", f"Impossible de supprimer :\n{e}")
             return
 
-        # Retirer du modèle et de l'arbre
         parent_item_id = self.tree.parent(item_id)
         parent_node = self.id_to_node.get(parent_item_id)
 
@@ -737,13 +729,12 @@ class WinDirScopeApp:
             "Suppression effectuée",
             "Le fichier / dossier a été supprimé du système de fichiers.\n"
             "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
-            "Relancez une analyse si nécessaire."
+            "Relancez une analyse si nécessaire.",
         )
 
     # ---------- Menu contextuel Top 100 ----------
 
     def on_top_right_click(self, event):
-        """Affiche le menu contextuel sur la ligne du Top 100."""
         item_id = self.top_tree.identify_row(event.y)
         if not item_id:
             return
@@ -791,7 +782,7 @@ class WinDirScopeApp:
             "Renommer",
             f"Nouveau nom pour :\n{path}",
             initialvalue=old_name,
-            parent=self.master
+            parent=self.master,
         )
         if not new_name or new_name == old_name:
             return
@@ -807,17 +798,14 @@ class WinDirScopeApp:
             messagebox.showerror("Erreur de renommage", f"Impossible de renommer :\n{e}")
             return
 
-        # Mise à jour du mapping Top 100
         self.top_id_to_path[self._top_context_id] = new_path
 
-        # Mise à jour des données top_files
         for r in self.top_files:
             if Path(r["path"]) == path:
                 r["path"] = str(new_path)
                 r["name"] = new_name
                 break
 
-        # Mise à jour de la ligne affichée (colonne chemin)
         values = list(self.top_tree.item(self._top_context_id, "values"))
         if len(values) >= 3:
             values[2] = str(new_path)
@@ -827,7 +815,7 @@ class WinDirScopeApp:
             "Renommage effectué",
             "Le renommage a été effectué sur le système de fichiers.\n"
             "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
-            "Relancez une analyse si nécessaire."
+            "Relancez une analyse si nécessaire.",
         )
 
     def cmd_top_delete(self):
@@ -845,7 +833,7 @@ class WinDirScopeApp:
             f"{path}\n\n"
             "Cette action ne passe pas par la corbeille et est irréversible.\n\n"
             "Confirmer la suppression ?",
-            icon=messagebox.WARNING
+            icon=messagebox.WARNING,
         ):
             return
 
@@ -862,14 +850,13 @@ class WinDirScopeApp:
                 "- fichier/dossier ouvert dans une autre application,\n"
                 "- antivirus ou logiciel de sauvegarde qui le verrouille,\n"
                 "- droits NTFS insuffisants.\n\n"
-                f"Détail :\n{e}"
+                f"Détail :\n{e}",
             )
             return
         except Exception as e:
             messagebox.showerror("Erreur de suppression", f"Impossible de supprimer :\n{e}")
             return
 
-        # Retirer de la vue et des données
         if self._top_context_id in self.top_id_to_path:
             del self.top_id_to_path[self._top_context_id]
         self.top_tree.delete(self._top_context_id)
@@ -880,50 +867,168 @@ class WinDirScopeApp:
             "Suppression effectuée",
             "Le fichier / dossier a été supprimé du système de fichiers.\n"
             "Les statistiques affichées ne sont pas recalculées automatiquement.\n"
-            "Relancez une analyse si nécessaire."
+            "Relancez une analyse si nécessaire.",
         )
 
     # ---------- Flatten pour export ----------
 
     def _flatten_tree(self):
-        """Retourne une liste de lignes à exporter pour l'arborescence."""
         rows = []
         total_size = self.root_node.size or 1
 
         def visit(node: Node):
             percent = (node.size / total_size) * 100
-            rows.append({
-                "path": str(node.path),
-                "name": node.name,
-                "level": node.level,
-                "type": "dossier" if node.is_dir else "fichier",
-                "size_bytes": node.size,
-                "size_human": human_size(node.size),
-                "percent_total": percent,
-                "access_denied": node.access_denied,
-            })
+            rows.append(
+                {
+                    "path": str(node.path),
+                    "name": node.name,
+                    "level": node.level,
+                    "type": "dossier" if node.is_dir else "fichier",
+                    "size_bytes": node.size,
+                    "size_human": human_size(node.size),
+                    "percent_total": percent,
+                    "access_denied": node.access_denied,
+                }
+            )
             for child in node.children:
                 visit(child)
 
         visit(self.root_node)
         return rows
 
-    # ---------- Export ----------
+    # ---------- Envoi par mail ----------
+
+    def on_send_report(self, fmt: str):
+        if not self.root_node:
+            messagebox.showwarning(
+                "Aucun résultat",
+                "Aucun dossier n'a encore été analysé. Lancez une analyse avant d'envoyer un rapport.",
+            )
+            return
+
+        self._compute_top_files()
+
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        raw_root_name = self.root_node.name or "analyse"
+        invalid_chars = '<>:"/\\|?*'
+        root_name = "".join(c for c in raw_root_name if c not in invalid_chars)
+        if not root_name.strip():
+            root_name = "racine"
+
+        tmp_dir = Path(tempfile.gettempdir())
+
+        try:
+            if fmt == "html":
+                filename = f"WinDirScope_{timestamp}_{root_name}.html"
+                html_path = tmp_dir / filename
+                self._export_html(html_path)
+                attach_path = html_path
+            elif fmt == "csv":
+                base = f"WinDirScope_{timestamp}_{root_name}_csv"
+                tree_file = tmp_dir / f"{base}_arborescence.csv"
+                ext_file = tmp_dir / f"{base}_extensions.csv"
+                top_file = tmp_dir / f"{base}_top100.csv"
+                self._export_tree_csv(tree_file)
+                self._export_ext_csv(ext_file)
+                self._export_top_csv(top_file)
+                zip_path = tmp_dir / f"{base}.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.write(tree_file, tree_file.name)
+                    z.write(ext_file, ext_file.name)
+                    z.write(top_file, top_file.name)
+                attach_path = zip_path
+            elif fmt == "json":
+                base = f"WinDirScope_{timestamp}_{root_name}_json"
+                tree_file = tmp_dir / f"{base}_arborescence.json"
+                ext_file = tmp_dir / f"{base}_extensions.json"
+                top_file = tmp_dir / f"{base}_top100.json"
+                self._export_tree_json(tree_file)
+                self._export_ext_json(ext_file)
+                self._export_top_json(top_file)
+                zip_path = tmp_dir / f"{base}.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.write(tree_file, tree_file.name)
+                    z.write(ext_file, ext_file.name)
+                    z.write(top_file, top_file.name)
+                attach_path = zip_path
+            elif fmt == "txt":
+                base = f"WinDirScope_{timestamp}_{root_name}_txt"
+                tree_file = tmp_dir / f"{base}_arborescence.txt"
+                ext_file = tmp_dir / f"{base}_extensions.txt"
+                top_file = tmp_dir / f"{base}_top100.txt"
+                self._export_tree_txt(tree_file)
+                self._export_ext_txt(ext_file)
+                self._export_top_txt(top_file)
+                zip_path = tmp_dir / f"{base}.zip"
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.write(tree_file, tree_file.name)
+                    z.write(ext_file, ext_file.name)
+                    z.write(top_file, top_file.name)
+                attach_path = zip_path
+            else:
+                messagebox.showerror("Format inconnu", f"Format non géré : {fmt}")
+                return
+        except Exception as e:
+            messagebox.showerror(
+                "Erreur de génération", f"Impossible de générer le rapport :\n{e}"
+            )
+            return
+
+        self._open_email_with_attachment(attach_path)
+
+    def _open_email_with_attachment(self, filepath: Path):
+        if os.name == "nt":
+            try:
+                import win32com.client  # type: ignore
+            except Exception:
+                messagebox.showinfo(
+                    "Fichier prêt",
+                    f"Le rapport a été généré :\n{filepath}\n\n"
+                    "Impossible d'utiliser Outlook automatiquement "
+                    "(module pywin32 manquant ?).\n"
+                    "Créez un nouveau mail et ajoutez ce fichier en pièce jointe.",
+                )
+                return
+
+            try:
+                outlook = win32com.client.Dispatch("Outlook.Application")
+                mail = outlook.CreateItem(0)
+                mail.Subject = f"Rapport WinDirScope - {self.root_node.name}"
+                mail.Body = (
+                    "Bonjour,\n\n"
+                    "Veuillez trouver en pièce jointe le rapport généré par WinDirScope.\n\n"
+                    "Cordialement,\n"
+                    "WinDirScope"
+                )
+                mail.Attachments.Add(str(filepath))
+                mail.Display(True)
+            except Exception as e:
+                messagebox.showerror(
+                    "Envoi par mail",
+                    "Impossible d'ouvrir un message Outlook avec la pièce jointe :\n"
+                    f"{e}\n\nLe fichier est néanmoins disponible ici :\n{filepath}",
+                )
+        else:
+            messagebox.showinfo(
+                "Fichier prêt",
+                f"Le rapport a été généré :\n{filepath}\n\n"
+                "Votre système ne permet pas l'ouverture automatique du client mail.\n"
+                "Créez un nouveau message et ajoutez ce fichier en pièce jointe.",
+            )
+
+    # ---------- Export classique ----------
 
     def on_export_results(self):
         if not self.root_node:
             messagebox.showwarning(
                 "Aucun résultat",
-                "Aucun dossier n'a encore été analysé. Lancez une analyse avant d'exporter."
+                "Aucun dossier n'a encore été analysé. Lancez une analyse avant d'exporter.",
             )
             return
 
-        # Assurer que le Top 100 est à jour
         self._compute_top_files()
 
-        # Nom par défaut : HTML, avec nettoyage des caractères interdits
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-
         raw_root_name = self.root_node.name or "analyse"
         invalid_chars = '<>:"/\\|?*'
         root_name = "".join(c for c in raw_root_name if c not in invalid_chars)
@@ -942,7 +1047,7 @@ class WinDirScopeApp:
                 ("Fichier JSON", "*.json"),
                 ("Fichier texte", "*.txt"),
             ],
-            initialfile=default_name
+            initialfile=default_name,
         )
         if not base_path_str:
             return
@@ -973,7 +1078,7 @@ class WinDirScopeApp:
                 html_file = base_path
                 self._export_html(html_file)
                 exported_files = [html_file]
-            else:  # CSV par défaut
+            else:  # CSV
                 tree_file = base_path.with_name(base_path.stem + "_arborescence.csv")
                 ext_file = base_path.with_name(base_path.stem + "_extensions.csv")
                 top_file = base_path.with_name(base_path.stem + "_top100.csv")
@@ -982,10 +1087,11 @@ class WinDirScopeApp:
                 self._export_top_csv(top_file)
                 exported_files = [tree_file, ext_file, top_file]
         except Exception as e:
-            messagebox.showerror("Erreur d'export", f"Impossible d'exporter les résultats : {e}")
+            messagebox.showerror(
+                "Erreur d'export", f"Impossible d'exporter les résultats : {e}"
+            )
             return
 
-        # Ouvrir automatiquement le rapport principal (premier fichier exporté)
         if exported_files:
             open_file_in_default_app(exported_files[0])
 
@@ -998,62 +1104,69 @@ class WinDirScopeApp:
         rows = self._flatten_tree()
         with filepath.open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow([
-                "Chemin complet",
-                "Nom",
-                "Niveau",
-                "Type",
-                "Taille (octets)",
-                "Taille lisible",
-                "% du total",
-                "Accès refusé"
-            ])
+            writer.writerow(
+                [
+                    "Chemin complet",
+                    "Nom",
+                    "Niveau",
+                    "Type",
+                    "Taille (octets)",
+                    "Taille lisible",
+                    "% du total",
+                    "Accès refusé",
+                ]
+            )
             for row in rows:
-                writer.writerow([
-                    row["path"],
-                    row["name"],
-                    row["level"],
-                    row["type"],
-                    row["size_bytes"],
-                    row["size_human"],
-                    f"{row['percent_total']:.4f}",
-                    "Oui" if row["access_denied"] else "Non",
-                ])
+                writer.writerow(
+                    [
+                        row["path"],
+                        row["name"],
+                        row["level"],
+                        row["type"],
+                        row["size_bytes"],
+                        row["size_human"],
+                        f"{row['percent_total']:.4f}",
+                        "Oui" if row["access_denied"] else "Non",
+                    ]
+                )
 
     def _export_ext_csv(self, filepath: Path):
         total_ext_size = sum(self.ext_stats.values()) or 1
         with filepath.open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow(["Extension", "Taille totale (octets)", "Taille lisible", "% du total"])
+            writer.writerow(
+                ["Extension", "Taille totale (octets)", "Taille lisible", "% du total"]
+            )
             for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
                 percent = (size / total_ext_size) * 100
-                writer.writerow([
-                    ext,
-                    size,
-                    human_size(size),
-                    f"{percent:.4f}",
-                ])
+                writer.writerow(
+                    [ext, size, human_size(size), f"{percent:.4f}"]
+                )
 
     def _export_top_csv(self, filepath: Path):
         with filepath.open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow([
-                "Chemin complet",
-                "Nom",
-                "Taille (octets)",
-                "Taille lisible",
-                "% du total",
-                "Niveau"
-            ])
+            writer.writerow(
+                [
+                    "Chemin complet",
+                    "Nom",
+                    "Taille (octets)",
+                    "Taille lisible",
+                    "% du total",
+                    "Niveau",
+                ]
+            )
             for row in self.top_files:
-                writer.writerow([
-                    row["path"],
-                    row["name"],
-                    row["size_bytes"],
-                    row["size_human"],
-                    f"{row['percent_total']:.4f}",
-                    row["level"],
-                ])
+                writer.writerow(
+                    [
+                        row["path"],
+                        row["name"],
+                        row["size_bytes"],
+                        row["size_human"],
+                        f"{row['percent_total']:.4f}",
+                        row["level"],
+                    ]
+                )
 
     # --- JSON ---
 
@@ -1067,12 +1180,14 @@ class WinDirScopeApp:
         items = []
         for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
             percent = (size / total_ext_size) * 100
-            items.append({
-                "extension": ext,
-                "size_bytes": size,
-                "size_human": human_size(size),
-                "percent_total": percent,
-            })
+            items.append(
+                {
+                    "extension": ext,
+                    "size_bytes": size,
+                    "size_human": human_size(size),
+                    "percent_total": percent,
+                }
+            )
         with filepath.open("w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
 
@@ -1117,13 +1232,12 @@ class WinDirScopeApp:
     # --- HTML ---
 
     def _export_html(self, filepath: Path):
-        """Export en page HTML avec dossiers repliables/dépliables, filtres et Top 100 fichiers."""
         def esc(s: str) -> str:
             return (
                 s.replace("&", "&amp;")
-                 .replace("<", "&lt;")
-                 .replace(">", "&gt;")
-                 .replace("\"", "&quot;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
             )
 
         total_size = self.root_node.size or 1
@@ -1159,7 +1273,7 @@ class WinDirScopeApp:
                     f'<details{open_attr}>'
                     f'<summary class="{classes}" '
                     f'data-name="{name_lc}" data-level="{lvl}" data-type="dir">'
-                    f'{line}</summary>'
+                    f"{line}</summary>",
                 ]
                 if node.children:
                     html.append("<ul>")
@@ -1175,7 +1289,7 @@ class WinDirScopeApp:
                 return (
                     f'<div class="{classes}" '
                     f'data-name="{name_lc}" data-level="{lvl}" data-type="file">'
-                    f'{line}</div>'
+                    f"{line}</div>"
                 )
 
         html_parts = []
@@ -1183,9 +1297,12 @@ class WinDirScopeApp:
         html_parts.append("<html lang='fr'>")
         html_parts.append("<head>")
         html_parts.append("<meta charset='utf-8'>")
-        html_parts.append(f"<title>WinDirScope - Rapport {esc(self.root_node.name)}</title>")
+        html_parts.append(
+            f"<title>WinDirScope - Rapport {esc(self.root_node.name)}</title>"
+        )
         html_parts.append("<style>")
-        html_parts.append("""
+        html_parts.append(
+            """
             body {
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
                 font-size: 14px;
@@ -1295,7 +1412,8 @@ class WinDirScopeApp:
                 color: #666;
                 padding: 8px 16px 12px 16px;
             }
-        """)
+        """
+        )
         html_parts.append("</style>")
         html_parts.append("</head>")
         html_parts.append("<body>")
@@ -1309,10 +1427,12 @@ class WinDirScopeApp:
         html_parts.append("</header>")
 
         html_parts.append("<main>")
+
         # Arborescence
         html_parts.append("<section class='tree'>")
         html_parts.append("<h2>Arborescence</h2>")
-        html_parts.append("""
+        html_parts.append(
+            """
         <div id="filters">
           <label>
             Nom contient :
@@ -1325,7 +1445,8 @@ class WinDirScopeApp:
           <button type="button" id="filter-apply">Appliquer</button>
           <button type="button" id="filter-reset">Réinitialiser</button>
         </div>
-        """)
+        """
+        )
         html_parts.append(node_to_html(self.root_node))
         html_parts.append("</section>")
 
@@ -1333,7 +1454,10 @@ class WinDirScopeApp:
         html_parts.append("<section class='ext'>")
         html_parts.append("<h2>Répartition par extension</h2>")
         html_parts.append("<table>")
-        html_parts.append("<thead><tr><th>Extension</th><th>Taille lisible</th><th>Taille (octets)</th><th>% du total</th></tr></thead>")
+        html_parts.append(
+            "<thead><tr><th>Extension</th><th>Taille lisible</th>"
+            "<th>Taille (octets)</th><th>% du total</th></tr></thead>"
+        )
         html_parts.append("<tbody>")
         for ext, size in sorted(self.ext_stats.items(), key=lambda kv: kv[1], reverse=True):
             percent = (size / total_ext_size) * 100 if total_ext_size > 0 else 0.0
@@ -1348,11 +1472,14 @@ class WinDirScopeApp:
         html_parts.append("</tbody></table>")
         html_parts.append("</section>")
 
-        # Top 100 fichiers
+        # Top 100
         html_parts.append("<section class='top'>")
         html_parts.append("<h2>Top 100 fichiers les plus volumineux</h2>")
         html_parts.append("<table>")
-        html_parts.append("<thead><tr><th>Nom</th><th>Taille lisible</th><th>Taille (octets)</th><th>% du total</th><th>Chemin complet</th></tr></thead>")
+        html_parts.append(
+            "<thead><tr><th>Nom</th><th>Taille lisible</th>"
+            "<th>Taille (octets)</th><th>% du total</th><th>Chemin complet</th></tr></thead>"
+        )
         html_parts.append("<tbody>")
         for row in self.top_files:
             html_parts.append(
@@ -1376,8 +1503,8 @@ class WinDirScopeApp:
         )
         html_parts.append("</footer>")
 
-        # Script JS pour filtres nom + niveau (corrigé avec masquage des <li>)
-        html_parts.append("""
+        html_parts.append(
+            """
 <script>
 (function() {
   const nameInput = document.getElementById('filter-name');
@@ -1393,7 +1520,6 @@ class WinDirScopeApp:
 
     const nodes = document.querySelectorAll('.node');
 
-    // 1) Marquer chaque noeud comme match / non-match
     nodes.forEach(function(el) {
       const name = (el.dataset.name || '').toLowerCase();
       const level = parseInt(el.dataset.level || '0', 10);
@@ -1409,8 +1535,6 @@ class WinDirScopeApp:
       el.dataset.match = match ? '1' : '0';
     });
 
-    // 2) Un dossier est visible s'il matche lui-même
-    //    OU s'il contient au moins un descendant qui matche
     nodes.forEach(function(el) {
       const type = el.dataset.type || 'file';
       let visible = (el.dataset.match === '1');
@@ -1425,7 +1549,6 @@ class WinDirScopeApp:
         }
       }
 
-      // On masque de préférence le <li> qui entoure la node (pour éviter les puces vides)
       let container = el.closest('li');
       if (!container) {
         if (type === 'dir') {
@@ -1443,14 +1566,12 @@ class WinDirScopeApp:
     if (nameInput) nameInput.value = '';
     if (levelInput) levelInput.value = '';
 
-    const details = document.querySelectorAll('details');
-    details.forEach(function(d) {
-      d.style.display = '';
-    });
-    const nodes = document.querySelectorAll('.node');
-    nodes.forEach(function(el) {
+    const containers = document.querySelectorAll('details, li, .node');
+    containers.forEach(function(el) {
       el.style.display = '';
-      el.dataset.match = '1';
+      if (el.classList && el.classList.contains('node')) {
+        el.dataset.match = '1';
+      }
     });
   }
 
@@ -1459,7 +1580,8 @@ class WinDirScopeApp:
   if (nameInput) nameInput.addEventListener('input', applyFilters);
 })();
 </script>
-""")
+"""
+        )
 
         html_parts.append("</body></html>")
 
